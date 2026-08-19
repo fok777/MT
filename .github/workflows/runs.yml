@@ -1,0 +1,55 @@
+name: Cleanup old workflow runs
+
+on:
+  schedule:
+    - cron: '0 3 1 * *'   # 每月1号 UTC 03:00 执行
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install gh CLI
+        run: |
+          type gh >/dev/null 2>&1 || {
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt update && sudo apt install -y gh
+          }
+
+      - name: Delete old runs, keep latest 2 per workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+
+          # 获取所有 workflow 的 ID 和名称
+          workflows=$(gh api repos/$REPO/actions/workflows --jq '.workflows[] | {id, name}')
+
+          echo "$workflows" | jq -c '.' | while read -r wf; do
+            wf_id=$(echo "$wf" | jq -r '.id')
+            wf_name=$(echo "$wf" | jq -r '.name')
+            echo "=== Processing: $wf_name (id=$wf_id) ==="
+
+            # 获取该 workflow 所有运行记录，按创建时间倒序，跳过前 2 条
+            runs_to_delete=$(gh api "repos/$REPO/actions/workflows/$wf_id/runs?per_page=100" \
+              --jq '.workflow_runs | sort_by(.created_at) | reverse | .[2:] | .[].id')
+
+            count=$(echo "$runs_to_delete" | grep -c . || true)
+            if [ "$count" -eq 0 ]; then
+              echo "  ✅ 不超过2条，无需清理"
+              continue
+            fi
+
+            echo "  🗑️  将删除 $count 条旧记录"
+            echo "$runs_to_delete" | while read -r run_id; do
+              gh api -X DELETE "repos/$REPO/actions/runs/$run_id" && echo "  ✅ 已删除 run $run_id" || echo "  ❌ 删除 run $run_id 失败"
+            done
+          done
+
+          echo "🎉 全部清理完成"

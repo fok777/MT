@@ -5,10 +5,13 @@ on:
     - cron: '3 */2 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 20
     steps:
     - name: 检出仓库
       uses: actions/checkout@v5
@@ -24,5 +27,4 @@ jobs:
         pip install -r requirements.txt
 
     - name: 运行
-      continue-on-error: true
       run: python verify.py

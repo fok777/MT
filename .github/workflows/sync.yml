@@ -2,7 +2,7 @@ name: Sync
 
 on:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "0 3 * * *"
   workflow_dispatch:
 
 permissions:
@@ -11,34 +11,51 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - name: Sync Push
+      - name: Sync Push（仅同步代理池与文档，代码以本地为准）
         continue-on-error: true
         run: |
           git remote add upstream https://github.com/klaas8/MT.git || true
-          git fetch upstream
-          EXCLUDE_FILES=("prefs.sqlite")
-          for file in "${EXCLUDE_FILES[@]}"; do
+          git fetch upstream || exit 0
+
+          # 这些文件始终保留本地版本，不被上游覆盖
+          KEEP=(
+            "main.py"
+            "verify.py"
+            "preferences.py"
+            "logger.py"
+            "requirements.txt"
+            "prefs.sqlite"
+            ".github/workflows/checkin.yml"
+            ".github/workflows/verify.yml"
+            ".github/workflows/sync.yml"
+          )
+
+          rm -rf .tmp-keep
+          for file in "${KEEP[@]}"; do
             if [ -f "$file" ]; then
-              mkdir -p .tmp-exclude
-              cp "$file" ".tmp-exclude/$(echo "$file" | tr '/' '_')"
+              mkdir -p ".tmp-keep/$(dirname "$file")"
+              cp "$file" ".tmp-keep/$file"
             fi
           done
-          # git reset --hard upstream/main
-          git read-tree -um HEAD
-          git read-tree -um upstream/main
-          for file in "${EXCLUDE_FILES[@]}"; do
-            backup_file=".tmp-exclude/$(echo "$file" | tr '/' '_')"
-            if [ -f "$backup_file" ]; then
-              cp "$backup_file" "$file"
-              git add "$file"
+
+          git read-tree -um upstream/main || exit 0
+
+          for file in "${KEEP[@]}"; do
+            if [ -f ".tmp-keep/$file" ]; then
+              mkdir -p "$(dirname "$file")"
+              cp ".tmp-keep/$file" "$file"
+              git add -f "$file"
             fi
           done
-          rm -rf .tmp-exclude
+          rm -rf .tmp-keep
+
           git -c user.name="GitHub Actions" -c user.email="actions@github.com" \
-            commit -m "Sync with upstream, exclude specified files" || true
+            commit -m "Sync upstream (keep local fixes)" || true
+          git pull --quiet --rebase origin main || true
           git push origin main --force

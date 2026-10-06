@@ -3,7 +3,7 @@
 
 修复要点：
 1. ips.txt 只进不出 -> 现在每次都会复检，失效代理直接剔除
-2. 候选池 verify.txt 耗尽后无来源 -> 增加在线抓取补充
+2. 候选池 verify.txt 与 ips.txt 合并复检，避免枯竭
 3. 保存失败静默吞掉 -> 增加日志
 """
 
@@ -22,7 +22,6 @@ BASE_URL = os.environ.get("MT_BASE_URL", "https://bbs.binmt.cc").rstrip("/")
 PROBE_URL = f"{BASE_URL}/forum.php?mod=guide&view=hot"
 TIMEOUT = int(os.environ.get("MT_TIMEOUT", "12"))
 MAX_CANDIDATE = int(os.environ.get("MT_MAX_CANDIDATE", "600"))
-FETCH_PROXY = os.environ.get("MT_FETCH_PROXY", "1") != "0"
 
 HEADERS = {
     'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
@@ -31,14 +30,6 @@ HEADERS = {
     'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
     'Connection': 'keep-alive',
 }
-
-PROXY_SOURCES = [
-    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=8000&country=all&ssl=all&anonymity=all",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://www.proxy-list.download/api/v1/get?type=http",
-    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
-]
 
 IP_RE = re.compile(r'^\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s*[:\s]\s*(\d{2,5})\s*$')
 
@@ -70,24 +61,6 @@ def read_list(path):
     except Exception:
         pass
     return out
-
-
-def fetch_online():
-    if not FETCH_PROXY:
-        return []
-    found = []
-    for url in PROXY_SOURCES:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=12)
-            if not r.ok:
-                continue
-            for line in r.text.splitlines():
-                m = IP_RE.match(line)
-                if m and validate_ip_port(m.group(1), m.group(2)):
-                    found.append(f"{m.group(1)}:{m.group(2)}")
-        except Exception:
-            continue
-    return found
 
 
 def verify(proxy):
@@ -125,12 +98,6 @@ def save(ips, pending):
 def main():
     old_ips = set(read_list(IPS_FILE))
     candidates = set(read_list(VERIFY_FILE))
-
-    if FETCH_PROXY:
-        online = set(fetch_online())
-        new = online - candidates - old_ips
-        logger.info(f"在线抓取代理 {len(online)} 个，新增候选 {len(new)} 个")
-        candidates |= new
 
     # 老代理也要复检，失效的剔除
     candidates -= old_ips

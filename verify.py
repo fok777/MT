@@ -1,107 +1,165 @@
-import requests, time, ipaddress, os
+# -*- coding: utf-8 -*-
+"""代理池维护脚本（修复版）
+
+修复要点：
+1. ips.txt 只进不出 -> 现在每次都会复检，失效代理直接剔除
+2. 候选池 verify.txt 耗尽后无来源 -> 增加在线抓取补充
+3. 保存失败静默吞掉 -> 增加日志
+"""
+
+import os
+import re
+import time
+import random
+import ipaddress
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
+
 from logger import logger
 
-nVerify = set()
-ips = set()
+BASE_URL = os.environ.get("MT_BASE_URL", "https://bbs.binmt.cc").rstrip("/")
+PROBE_URL = f"{BASE_URL}/forum.php?mod=guide&view=hot"
+TIMEOUT = int(os.environ.get("MT_TIMEOUT", "12"))
+MAX_CANDIDATE = int(os.environ.get("MT_MAX_CANDIDATE", "600"))
+FETCH_PROXY = os.environ.get("MT_FETCH_PROXY", "1") != "0"
+
+HEADERS = {
+    'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                   '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Connection': 'keep-alive',
+}
+
+PROXY_SOURCES = [
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=8000&country=all&ssl=all&anonymity=all",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://www.proxy-list.download/api/v1/get?type=http",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+]
+
+IP_RE = re.compile(r'^\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s*[:\s]\s*(\d{2,5})\s*$')
+
+VERIFY_FILE = "src/verify.txt"
+IPS_FILE = "src/ips.txt"
+
 
 def validate_ip_port(ip, port):
     try:
         ip_obj = ipaddress.ip_address(ip)
-        if ip_obj.is_multicast or ip_obj.is_unspecified:
+        if ip_obj.is_multicast or ip_obj.is_unspecified or not ip_obj.is_global:
             return False
     except ValueError:
         return False
-    ip_parts = ip.split('.')
-    for part in ip_parts:
-        if not 0 <= int(part) <= 255:
-            return False
-    if not 1 <= int(port) <= 65535:
+    try:
+        return 1 <= int(port) <= 65535
+    except ValueError:
         return False
-    return True
 
-def save():
-    fileName = "src/verify.txt"
-    fileName2 = "src/ips.txt"
+
+def read_list(path):
+    out = []
     try:
-        with open(fileName, "w", encoding="utf-8") as f:
-            f.write("\n".join(nVerify))
-    except Exception as e:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                m = IP_RE.match(line)
+                if m and validate_ip_port(m.group(1), m.group(2)):
+                    out.append(f"{m.group(1)}:{m.group(2)}")
+    except Exception:
         pass
+    return out
+
+
+def fetch_online():
+    if not FETCH_PROXY:
+        return []
+    found = []
+    for url in PROXY_SOURCES:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=12)
+            if not r.ok:
+                continue
+            for line in r.text.splitlines():
+                m = IP_RE.match(line)
+                if m and validate_ip_port(m.group(1), m.group(2)):
+                    found.append(f"{m.group(1)}:{m.group(2)}")
+        except Exception:
+            continue
+    return found
+
+
+def verify(proxy):
+    proxies = {'http': f'http://{proxy}', 'https': f'http://{proxy}'}
+    start = time.time()
     try:
-        with open(fileName2, "w", encoding="utf-8") as f:
-            f.write("\n".join(ips))
+        r = requests.get(PROBE_URL, headers=HEADERS, proxies=proxies, timeout=TIMEOUT)
+        return proxy, (r.ok and r.status_code == 200), int((time.time() - start) * 1000)
+    except Exception:
+        return proxy, False, -1
+
+
+def save(ips, pending):
+    try:
+        os.makedirs("src", exist_ok=True)
+        with open(IPS_FILE, "w", encoding="utf-8") as f:
+            f.write("\n".join(sorted(ips)))
+        with open(VERIFY_FILE, "w", encoding="utf-8") as f:
+            f.write("\n".join(sorted(pending)))
     except Exception as e:
-        pass
+        logger.error(f"写入代理文件失败: {e}")
+        return
     try:
         os.system('git config --local user.name "github-actions[bot]" >/dev/null 2>&1')
         os.system('git config --local user.email "github-actions[bot]@users.noreply.github.com" >/dev/null 2>&1')
-        if os.system(f'git add {fileName} {fileName2} >/dev/null 2>&1') == 0:
-            os.system('git commit -m "更新" >/dev/null 2>&1')
-            os.system('git pull --quiet --rebase')
-            os.system('git push --quiet --force-with-lease')
+        if os.system(f'git add {IPS_FILE} {VERIFY_FILE} >/dev/null 2>&1') == 0:
+            os.system('git commit -m "更新代理池" >/dev/null 2>&1')
+            os.system('git pull --quiet --rebase >/dev/null 2>&1')
+            os.system('git push --quiet --force-with-lease >/dev/null 2>&1')
+            logger.info("代理池已更新")
     except Exception as e:
-        logger.critical(f"异常: {e}")
-        pass
+        logger.error(f"提交代理池失败: {e}")
 
-def load():
-    fileName = "src/verify.txt"
-    fileName2 = "src/ips.txt"
+
+def main():
+    old_ips = set(read_list(IPS_FILE))
+    candidates = set(read_list(VERIFY_FILE))
+
+    if FETCH_PROXY:
+        online = set(fetch_online())
+        new = online - candidates - old_ips
+        logger.info(f"在线抓取代理 {len(online)} 个，新增候选 {len(new)} 个")
+        candidates |= new
+
+    # 老代理也要复检，失效的剔除
+    candidates -= old_ips
+    pool = list(old_ips) + list(candidates)
+    random.shuffle(pool)
+    pool = pool[:MAX_CANDIDATE]
+
+    logger.info(f"待验证代理 {len(pool)} 个（其中复检老代理 {len(old_ips)} 个）")
+
+    good, dead = [], []
+    with ThreadPoolExecutor(max_workers=40) as ex:
+        futures = [ex.submit(verify, p) for p in pool]
+        for fu in as_completed(futures):
+            proxy, ok, ms = fu.result()
+            (good if ok else dead).append((proxy, ms))
+
+    good.sort(key=lambda x: x[1])
+    logger.info(f"可用 {len(good)} / 失效 {len(dead)}")
+    for i, (proxy, ms) in enumerate(good[:20], 1):
+        logger.info(f"  {i}: {proxy} - {ms}ms")
+
+    ips = {p for p, _ in good}
+    # 未验证通过的候选重新放回候选池（限量，避免无限膨胀）
+    pending = set(candidates) - ips
+    save(ips, list(pending)[:400])
+
+
+if __name__ == "__main__":
     try:
-        with open(fileName, "r", encoding="utf-8") as f:
-            for line in f:
-                ip = line.strip()
-                if ":" not in ip or not ip: continue
-                newIp, newPort = ip.split(':', 1)
-                if not validate_ip_port(newIp, newPort): continue
-                nVerify.add(ip)
+        main()
     except Exception as e:
-        pass
-    try:
-        with open(fileName2, "r", encoding="utf-8") as f:
-            for line in f:
-                ip = line.strip()
-                if ":" not in ip or not ip: continue
-                newIp, newPort = ip.split(':', 1)
-                if not validate_ip_port(newIp, newPort): continue
-                ips.add(ip)
-    except Exception as e:
-        pass
-
-headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/86.0.4240.198 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    'Connection': 'keep-alive'
-}
-
-def verify(proxy):
-    target_url = 'https://bbs.binmt.cc/forum.php?mod=guide&view=hot'
-    proxies = {
-        'https': f'http://{proxy}',
-        'http': f'http://{proxy}'
-    }
-    start_time = time.time()
-    try:
-        response = requests.get(target_url, headers=headers, proxies=proxies, timeout=20)
-        return proxy, response.ok, int((time.time() - start_time) * 1000)
-    except:
-        return proxy, False, -1
-load()
-successful_proxies = []
-with ThreadPoolExecutor(max_workers=20) as executor:
-    futures = {executor.submit(verify, proxy): i for i, proxy in enumerate(nVerify)}
-    for idx, future in enumerate(as_completed(futures), 1):
-        proxy, is_valid, requestTime = future.result()
-        logger.info(f"{idx}: {'√' if is_valid else '×'} {proxy} [{requestTime}ms]")
-        if is_valid:
-            successful_proxies.append((proxy, requestTime))
-            nVerify.discard(proxy)
-successful_proxies.sort(key=lambda x: x[1])
-print()
-logger.info("可用IP代理:")
-for idx, (proxy, req_time) in enumerate(successful_proxies, 1):
-    logger.info(f"{idx}: {proxy} - {req_time}ms")
-    ips.add(proxy)
-nVerify -= ips
-save()
+        logger.error(f"运行异常: {type(e).__name__} {e}")

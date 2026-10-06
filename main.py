@@ -7,6 +7,7 @@
 3. formhash / loginhash 提取正则过脆 -> 改为多模式 + 非空校验
 4. 签到失败却 exit 0，Actions 永远绿色 -> 失败时 exit 1
 5. 代理池无补充来源 -> 可选在线抓取免费代理
+6. 论坛前置阿里云 ESA acw_sc__v2 JS 挑战 -> 首次访问自动计算 cookie 过挑战（核心修复）
 """
 
 import os
@@ -19,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
+import esa
 from preferences import prefs
 from logger import logger
 
@@ -54,6 +56,18 @@ LOGIN_OK_RE = re.compile(r'登录成功|欢迎您回来|succeed', re.I)
 
 SUCCESS_RE = re.compile(r'已签|签到成功|签到完成|签到已完成|恭喜|success|qiandao_success|获得', re.I)
 FAIL_RE = re.compile(r'失败|错误|未登录|请登录|非法|请先登录|重新登录|异常', re.I)
+
+
+def esa_get(session, url, **kw):
+    """带 ESA acw 挑战处理的 GET（挑战识别与算法还原实现见 esa.py）"""
+    kw.setdefault('timeout', TIMEOUT)
+    return esa.get(session, url, logger=logger, **kw)
+
+
+def esa_request(session, method, url, **kw):
+    """带 ESA acw 挑战处理的任意方法请求"""
+    kw.setdefault('timeout', TIMEOUT)
+    return esa.request(session, method, url, logger=logger, **kw)
 
 
 def is_phone_number(username):
@@ -145,8 +159,11 @@ def _verify(proxy):
     proxies = {'http': f'http://{proxy}', 'https': f'http://{proxy}'}
     start = time.time()
     try:
-        r = requests.get(PROBE_URL, headers=HEADERS, proxies=proxies, timeout=min(TIMEOUT, 12))
-        ok = r.ok and r.status_code == 200
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        s.proxies = proxies
+        r = esa_get(s, PROBE_URL, timeout=min(TIMEOUT, 12))
+        ok = r.ok and r.status_code == 200 and not esa.is_challenge(r.text)
         return proxy, ok, int((time.time() - start) * 1000)
     except Exception:
         return proxy, False, -1
@@ -191,8 +208,10 @@ def load_proxies():
 def direct_ok():
     """检测 runner 本机能否直连论坛"""
     try:
-        r = requests.get(PROBE_URL, headers=HEADERS, timeout=min(TIMEOUT, 15))
-        ok = r.ok and r.status_code == 200
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        r = esa_get(s, PROBE_URL, timeout=min(TIMEOUT, 15))
+        ok = r.ok and r.status_code == 200 and not esa.is_challenge(r.text)
         logger.info(f"直连检测: {'可用' if ok else '不可用'} (HTTP {r.status_code})")
         return ok
     except Exception as e:
@@ -212,10 +231,13 @@ def check_in(user, pwd, proxy=None):
     logger.info(f"{format_username(user)} 开始签到（{tag}）")
     try:
         # 1. 取登录页，拿 loginhash / formhash
-        r = session.get(LOGIN_URL, timeout=TIMEOUT)
+        r = esa_get(session, LOGIN_URL, timeout=TIMEOUT)
         r.encoding = r.apparent_encoding or 'utf-8'
         if not r.ok:
             logger.warning(f"{format_username(user)} 登录页获取失败 HTTP {r.status_code}")
+            return False
+        if esa.is_challenge(r.text):
+            logger.warning(f"{format_username(user)} 仍停留在 ESA 挑战页，跳过该通道")
             return False
 
         _loginhash = loginhash(r.text)
@@ -237,7 +259,7 @@ def check_in(user, pwd, proxy=None):
             'answer': '',
             'agreebbrule': '',
         }
-        r = session.post(login_url, data=data, timeout=TIMEOUT)
+        r = esa_request(session, 'POST', login_url, data=data, timeout=TIMEOUT)
         r.encoding = r.apparent_encoding or 'utf-8'
         state = check_login(r.text)
         if state is False:
@@ -248,7 +270,7 @@ def check_in(user, pwd, proxy=None):
 
         # 3. 进入签到页拿新的 formhash
         time.sleep(1)
-        r = session.get(SIGN_PAGE, timeout=TIMEOUT)
+        r = esa_get(session, SIGN_PAGE, timeout=TIMEOUT)
         r.encoding = r.apparent_encoding or 'utf-8'
         if not r.ok:
             logger.warning(f"{format_username(user)} 签到页获取失败 HTTP {r.status_code}")
@@ -260,7 +282,7 @@ def check_in(user, pwd, proxy=None):
 
         # 4. 发起签到
         time.sleep(1)
-        r = session.get(SIGN_API.format(_formhash), timeout=TIMEOUT)
+        r = esa_get(session, SIGN_API.format(_formhash), timeout=TIMEOUT)
         r.encoding = r.apparent_encoding or 'utf-8'
         text = cdata(r.text)
         if SUCCESS_RE.search(text):
@@ -270,7 +292,7 @@ def check_in(user, pwd, proxy=None):
         if FAIL_RE.search(text):
             return False
         # 兜底：回查签到页是否已签
-        chk = session.get(SIGN_PAGE, timeout=TIMEOUT)
+        chk = esa_get(session, SIGN_PAGE, timeout=TIMEOUT)
         chk.encoding = chk.apparent_encoding or 'utf-8'
         if SUCCESS_RE.search(chk.text) or '已签' in chk.text:
             logger.info(f"{format_username(user)} 回查确认已签到")

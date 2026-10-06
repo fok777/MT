@@ -26,11 +26,11 @@ from logger import logger
 BASE_URL = os.environ.get("MT_BASE_URL", "https://bbs.binmt.cc").rstrip("/")
 TIMEOUT = int(os.environ.get("MT_TIMEOUT", "20"))
 MAX_PROXY = int(os.environ.get("MT_MAX_PROXY", "250"))
-# auto  = 直连优先，失败再用代理（默认，最稳）
-# proxy = 代理优先，失败再直连
+# proxy = 国内代理优先，失败再直连（默认）
+#         GitHub runner 位于海外，直连易触发论坛滑块验证，故默认不走直连
+# auto  = 代理优先，代理全部失效时才用直连兜底
 # direct= 只用直连
-PROXY_MODE = os.environ.get("MT_PROXY_MODE", "auto").strip().lower()
-FETCH_PROXY = os.environ.get("MT_FETCH_PROXY", "1") != "0"
+PROXY_MODE = os.environ.get("MT_PROXY_MODE", "proxy").strip().lower()
 FORCE_SIGN = os.environ.get("MT_FORCE", "0") == "1"
 
 LOGIN_URL = (f"{BASE_URL}/member.php?mod=logging&action=login"
@@ -46,14 +46,6 @@ HEADERS = {
     'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
     'Connection': 'keep-alive',
 }
-
-PROXY_SOURCES = [
-    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=8000&country=all&ssl=all&anonymity=all",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://www.proxy-list.download/api/v1/get?type=http",
-    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
-]
 
 IP_RE = re.compile(r'^\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s*[:\s]\s*(\d{2,5})\s*$')
 
@@ -149,24 +141,6 @@ def _read_proxy_file(path):
     return out
 
 
-def fetch_online_proxies():
-    if not FETCH_PROXY:
-        return []
-    found = []
-    for url in PROXY_SOURCES:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=12)
-            if not r.ok:
-                continue
-            for line in r.text.splitlines():
-                m = IP_RE.match(line)
-                if m and validate_ip_port(m.group(1), m.group(2)):
-                    found.append(f"{m.group(1)}:{m.group(2)}")
-        except Exception:
-            continue
-    return found
-
-
 def _verify(proxy):
     proxies = {'http': f'http://{proxy}', 'https': f'http://{proxy}'}
     start = time.time()
@@ -189,13 +163,9 @@ def load_proxies():
                 seen.add(p)
                 candidates.append(p)
 
+    # 只用仓库内的国内代理池，不引入在线来源（海外 IP 会触发论坛滑块验证）
     add(_read_proxy_file("src/ips.txt"))
     add(_read_proxy_file("src/verify.txt"))
-    if FETCH_PROXY:
-        online = fetch_online_proxies()
-        random.shuffle(online)
-        add(online)
-        logger.info(f"在线补充代理候选 {len(online)} 个")
 
     candidates = candidates[:MAX_PROXY]
     if not candidates:
@@ -364,16 +334,16 @@ def main():
     can_direct = False
     if PROXY_MODE in ("auto", "proxy"):
         proxies = load_proxies()
-    if PROXY_MODE in ("auto", "direct"):
-        can_direct = direct_ok()
+    if PROXY_MODE in ("auto", "direct", "proxy"):
+        # 只在代理不足时才探测直连（runner 在海外，直连易触发滑块）
+        if PROXY_MODE == "direct" or not proxies:
+            can_direct = direct_ok()
 
-    if PROXY_MODE == "proxy":
-        channels = proxies + (["__direct__"] if can_direct or not proxies else [])
-    else:
-        channels = (["__direct__"] if can_direct else []) + proxies
+    # 国内代理始终排前面，直连仅作最后兜底
+    channels = proxies + (["__direct__"] if can_direct else [])
 
     if not channels:
-        logger.error("直连不可用且没有可用代理，无法签到")
+        logger.error("没有可用代理且直连不可用，无法签到")
         return 1
 
     logger.info(f"本次可用通道 {len(channels)} 个")

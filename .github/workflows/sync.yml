@@ -23,7 +23,7 @@ jobs:
           git remote add upstream https://github.com/klaas8/MT.git || true
           git fetch upstream || exit 0
 
-          # 这些文件始终保留本地版本，不被上游覆盖
+          # 这些文件始终保留本地版本，即使上游同名也不被覆盖
           KEEP=(
             "main.py"
             "verify.py"
@@ -31,29 +31,52 @@ jobs:
             "logger.py"
             "requirements.txt"
             "prefs.sqlite"
+            "esa.py"
             ".github/workflows/checkin.yml"
             ".github/workflows/verify.yml"
             ".github/workflows/sync.yml"
           )
 
+          # 1) 快照全部本地文件，用于恢复 read-tree 删除的本地新增文件
           rm -rf .tmp-keep
-          for file in "${KEEP[@]}"; do
+          for file in $(git ls-tree -r --name-only HEAD); do
             if [ -f "$file" ]; then
               mkdir -p ".tmp-keep/$(dirname "$file")"
-              cp "$file" ".tmp-keep/$file"
+              cp -p "$file" ".tmp-keep/$file"
             fi
           done
 
+          # read-tree 会把工作树对齐上游：上游不存在的本地新文件（如 esa.py）
+          # 会被直接删除，必须在之后恢复，否则 KEEP 文件里的 import 会报错
           git read-tree -um upstream/main || exit 0
 
+          # 2) 恢复被 read-tree 删掉的本地新增文件
+          find .tmp-keep -type f 2>/dev/null | while read -r snap; do
+            rel="${snap#.tmp-keep/}"
+            if [ ! -f "$rel" ]; then
+              mkdir -p "$(dirname "$rel")"
+              cp -p "$snap" "$rel"
+              git add -f "$rel"
+            fi
+          done
+
+          # 3) KEEP 文件强制用本地版本
           for file in "${KEEP[@]}"; do
             if [ -f ".tmp-keep/$file" ]; then
               mkdir -p "$(dirname "$file")"
-              cp ".tmp-keep/$file" "$file"
+              cp -p ".tmp-keep/$file" "$file"
               git add -f "$file"
             fi
           done
           rm -rf .tmp-keep
+
+          # 4) 自检：本地新增文件与 KEEP 文件任一丢失则中止，不推送破坏性结果
+          for file in esa.py main.py verify.py; do
+            if [ ! -f "$file" ]; then
+              echo "::error::sync 后 $file 丢失，中止推送"
+              exit 0
+            fi
+          done
 
           git -c user.name="GitHub Actions" -c user.email="actions@github.com" \
             commit -m "Sync upstream (keep local fixes)" || true

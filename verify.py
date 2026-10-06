@@ -5,6 +5,7 @@
 1. ips.txt 只进不出 -> 现在每次都会复检，失效代理直接剔除
 2. 候选池 verify.txt 与 ips.txt 合并复检，避免枯竭
 3. 保存失败静默吞掉 -> 增加日志
+4. ESA acw 挑战页返回 200 会被误判为可用代理 -> 过挑战后再判定
 """
 
 import os
@@ -16,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
+import esa
 from logger import logger
 
 BASE_URL = os.environ.get("MT_BASE_URL", "https://bbs.binmt.cc").rstrip("/")
@@ -64,11 +66,16 @@ def read_list(path):
 
 
 def verify(proxy):
+    """ESA 挑战页同样返回 200，必须确认拿到真实业务页面才算代理可用"""
     proxies = {'http': f'http://{proxy}', 'https': f'http://{proxy}'}
     start = time.time()
     try:
-        r = requests.get(PROBE_URL, headers=HEADERS, proxies=proxies, timeout=TIMEOUT)
-        return proxy, (r.ok and r.status_code == 200), int((time.time() - start) * 1000)
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        s.proxies = proxies
+        r = esa.get(s, PROBE_URL, timeout=TIMEOUT)
+        ok = r.ok and r.status_code == 200 and not esa.is_challenge(r.text)
+        return proxy, ok, int((time.time() - start) * 1000)
     except Exception:
         return proxy, False, -1
 

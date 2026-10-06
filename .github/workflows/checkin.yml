@@ -7,10 +7,27 @@ on:
     - cron: '0 0 * * *'
     - cron: '0 12 * * *'
   workflow_dispatch:
+    inputs:
+      force:
+        description: '忽略"今日已签"记录，强制签到'
+        type: boolean
+        default: false
+      proxy_mode:
+        description: '通道模式'
+        type: choice
+        default: auto
+        options:
+          - auto
+          - direct
+          - proxy
+
+permissions:
+  contents: write
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
 
     steps:
     - uses: actions/checkout@v5
@@ -22,10 +39,9 @@ jobs:
         python-version: '3.11'
 
     - name: Check permissions
+      continue-on-error: true
       run: |
-        if ! gh workflow enable sync.yml >/dev/null 2>&1; then
-          exit 1
-        fi
+        gh workflow enable sync.yml >/dev/null 2>&1 || true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -33,19 +49,22 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        
+
     - name: 随机延迟
-      run: sleep $((RANDOM % 180))
-        
+      run: sleep $((RANDOM % 120))
+
     - name: 运行签到
       env:
         ACCOUNTS: ${{ secrets.ACCOUNTS }}
+        MT_PROXY_MODE: ${{ github.event.inputs.proxy_mode || 'auto' }}
+        MT_FORCE: ${{ github.event.inputs.force && '1' || '0' }}
       run: python main.py
-      
+
     - name: Empty commit
+      if: always()
       run: |
         git config user.name "github-actions" >/dev/null 2>&1
         git config user.email "github-actions@github.com" >/dev/null 2>&1
         git commit --allow-empty -m "chore: keepalive" >/dev/null 2>&1
-        git pull --quiet origin main >/dev/null 2>&1
+        git pull --quiet --rebase origin main >/dev/null 2>&1
         git push --quiet origin main >/dev/null 2>&1
